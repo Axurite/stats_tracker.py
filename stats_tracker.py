@@ -32,9 +32,6 @@ def get_session():
 
     return _thread_local.session
 
-
-
-
 def get_json_with_retries(url, attempts=5, timeout=30):
     last_error = None
     session = get_session()
@@ -103,7 +100,6 @@ def fetch_game(item):
     except RuntimeError as error:
         return game_id, game_info, None, error
 
-
 def load_games():
     if not os.path.isfile(ALL_GAMES_PATH):
         return {}
@@ -111,11 +107,9 @@ def load_games():
     with open(ALL_GAMES_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
 def save_games(games):
     with open(ALL_GAMES_PATH, "w", encoding="utf-8") as f:
         json.dump(games, f, indent=2)
-
 
 def update_rosters():
     league_ids = [
@@ -314,6 +308,7 @@ def update_rosters_deep():
 
             player_info["effective_level"] = effective_level
             player_info["throws"] = player.get("Throws")
+            player_info["equipment"] = player.get("Equipment")
 
             drip_score = 0
 
@@ -406,7 +401,6 @@ def update_games(s, hard_reset=False):
             break
 
     save_games(games)
-
 
 # add data from unrecorded games to the player_data.json file
 def record_games(toi=None, hard_reset=False):
@@ -573,7 +567,6 @@ def record_games(toi=None, hard_reset=False):
         encoding="utf-8",
     ) as f:
         json.dump(players, f, indent=2)
-
 
 # create a json that stores common human metrics for players
 def calculate_human_stats():
@@ -1028,8 +1021,6 @@ def print_overview(playerID, roster_info, numbers, header="position"):
     print(to_print)
 
 with chdir(os.path.dirname(os.path.realpath(__file__))):
-    
-
     current = requests.get("https://mmolb.com/api/seasons").json()["seasons"][0]["season_id"]
     yesno = ""
 
