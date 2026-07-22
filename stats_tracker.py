@@ -130,12 +130,7 @@ def update_rosters():
     # First fetch the league records and gather all their team IDs.
     teams_to_fetch = []
 
-    for league_id in tqdm(
-        league_ids,
-        desc="Fetching leagues",
-        unit="league",
-        dynamic_ncols=True,
-    ):
+    for league_id in league_ids:
         try:
             league = get_json_with_retries(
                 f"https://mmolb.com/api/league/{league_id}"
@@ -162,13 +157,7 @@ def update_rosters():
             teams_to_fetch,
         )
 
-        for league_id, team_id, team, error in tqdm(
-            fetched_teams,
-            total=len(teams_to_fetch),
-            desc="Fetching teams",
-            unit="team",
-            dynamic_ncols=True,
-        ):
+        for league_id, team_id, team, error in fetched_teams:
             if error is not None:
                 tqdm.write(
                     f"Skipping team {team_id}: {error}"
@@ -252,6 +241,9 @@ def update_rosters():
                     f"{team['Location']} {team['Name']}"
                 ),
                 "members": members,
+                "wins": wins,
+                "losses": losses,
+                "rd": record.get("RunDifferential", 0)
             }
 
     roster_info = {
@@ -280,10 +272,7 @@ def update_rosters_deep():
 
     player_ids = list(roster_info["players"])
 
-    print(
-        f"Fetching individual player info "
-        f"with {FETCH_WORKERS} workers..."
-    )
+    print(f"Fetching individual player info...")
 
     progress = tqdm(
         total=len(player_ids),
@@ -371,12 +360,7 @@ def update_games(s, hard_reset=False):
     )
 
     for day_counter, day_id in enumerate(
-        tqdm(
-            season["Days"],
-            desc="Searching season days",
-            unit="day",
-            dynamic_ncols=True,
-        ),
+        season["Days"],
         start=1,
     ):
         if day_counter < start_search_from:
@@ -588,7 +572,7 @@ def record_games(toi=None, hard_reset=False):
         "w",
         encoding="utf-8",
     ) as f:
-        json.dump(players, f)
+        json.dump(players, f, indent=2)
 
 
 # create a json that stores common human metrics for players
@@ -648,7 +632,7 @@ def calculate_human_stats():
             result["LDO%"] = good_shit["line_drive_fielded"] / (good_shit["line_drive_fielded"] + good_shit["line_drive_allowed"])
         full_result[p] = result
     with open("data/processed_player_data.json", "w") as f:
-        json.dump(full_result, f)
+        json.dump(full_result, f, indent=2)
         f.close()
 
 # calculate 100 thresholds for each calculated human stat and stores them in stat_barriers
@@ -688,7 +672,7 @@ def calculate_percentiles():
         # print(results)
         barriers[stat] = results
     with open("data/stat_barriers.json", "w") as f:
-        json.dump(barriers, f)
+        json.dump(barriers, f, indent=2)
 
 # return the ansi string that will color a piece of text in the console
 def color(stat, value):
