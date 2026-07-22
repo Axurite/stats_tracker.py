@@ -2,209 +2,594 @@ import requests
 import json
 import os
 import defense
+import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import local
 import stats_config as config
 from contextlib import chdir
+from tqdm import tqdm
+from difflib import get_close_matches
 
 
-def update_rosters(quick=False):
-    leagues = [config.valid_options()["leagues"][i] for i in config.get_config()["leagues"]]
+ALL_GAMES_PATH = "data/all_games.json"
+FETCH_WORKERS = min(16, (os.cpu_count() or 1) + 4)
+_thread_local = local()
+
+
+def get_session():
+    """Return one persistent HTTP session per fetch thread."""
+    if not hasattr(_thread_local, "session"):
+        session = requests.Session()
+
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=FETCH_WORKERS,
+            pool_maxsize=FETCH_WORKERS,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+
+        _thread_local.session = session
+
+    return _thread_local.session
+
+
+
+
+def get_json_with_retries(url, attempts=5, timeout=30):
+    last_error = None
+    session = get_session()
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.get(url, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.HTTPError,
+            ValueError,
+        ) as error:
+            last_error = error
+
+            if attempt < attempts:
+                delay = min(2 ** attempt, 30)
+
+                tqdm.write(
+                    f"Request failed ({attempt}/{attempts}): {url}\n"
+                    f"{type(error).__name__}: {error}\n"
+                    f"Retrying in {delay}s..."
+                )
+
+                time.sleep(delay)
+
+    raise RuntimeError(
+        f"Failed to fetch {url} after {attempts} attempts"
+    ) from last_error
+
+def fetch_player(player_id):
+    try:
+        player = get_json_with_retries(
+            f"https://mmolb.com/api/player/{player_id}"
+        )
+        return player_id, player, None
+
+    except RuntimeError as error:
+        return player_id, None, error
+
+def fetch_team(item):
+    league_id, team_id = item
+
+    try:
+        team = get_json_with_retries(
+            f"https://mmolb.com/api/team/{team_id}"
+        )
+        return league_id, team_id, team, None
+
+    except RuntimeError as error:
+        return league_id, team_id, None, error
+
+def fetch_game(item):
+    """Fetch one game without mutating shared player/stat data."""
+    game_id, game_info = item
+
+    try:
+        game = get_json_with_retries(
+            f"https://mmolb.com/api/game/{game_id}"
+        )
+        return game_id, game_info, game, None
+
+    except RuntimeError as error:
+        return game_id, game_info, None, error
+
+
+def load_games():
+    if not os.path.isfile(ALL_GAMES_PATH):
+        return {}
+
+    with open(ALL_GAMES_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_games(games):
+    with open(ALL_GAMES_PATH, "w", encoding="utf-8") as f:
+        json.dump(games, f, indent=2)
+
+
+def update_rosters():
+    league_ids = [
+        config.valid_options()["leagues"][index]
+        for index in config.get_config()["leagues"]
+    ]
+
     player_dict = {}
     team_dict = {}
     league_dict = {}
-    quick_team_dict = []
-    if quick:
-        if os.path.isfile("data/roster_info.json"):
-            with open("data/roster_info.json", "r") as f:
-                roster_info = json.load(f)
-                quick_team_dict = [i for i in roster_info["teams"].keys()]
-        else:
-            print("quick roster update can't be done before a normal one, doing a normal roster update")
-            quick = False
-    for l in leagues:
-        league = requests.get(f"https://mmolb.com/api/league/{l}").json()
-        for t in league["Teams"]:
-            if not quick or t in quick_team_dict:
-                team = requests.get(f"https://mmolb.com/api/team/{t}").json()
-                if team["Record"]["Regular Season"]["Losses"] + team["Record"]["Regular Season"]["Wins"] > 0: # we only care about active teams
-                    print(f"Fetching team info: {team["Location"]} {team["Name"]}")
-                    members = []
-                    for p in team["Players"]: # write down all the players
-                        if p["PlayerID"] != "#": # we'll discard empty slots, who all have the ID of "#"
-                            designated_hitter = False
-                            for i in members:
-                                if player_dict[i]["position"] == p["Position"] and p["Position"] not in ["SP", "RP"]:
-                                    designated_hitter = True
-                            if designated_hitter:
-                                player_dict[p["PlayerID"]] = {"name": f"{p["FirstName"]} {p["LastName"]}", "position": "DH", "team": f"{t}", "bench": False}
-                            else:
-                                player_dict[p["PlayerID"]] = {"name": f"{p["FirstName"]} {p["LastName"]}", "position": f"{p["Position"]}", "team": f"{t}", "bench": False}
-                            members.append(p["PlayerID"])
-                    for p in team["Bench"]: # batter and pitcher
-                        for k in team["Bench"][p]: # 1 2 3 and 4
-                            if k["PlayerID"] != "#":
-                                player_dict[k["PlayerID"]] = {"name": f"{k["FirstName"]} {k["LastName"]}", "position": k["Slot"], "team": f"{t}", "bench": True}
-                                members.append(k["PlayerID"])
-                            
-                    # write down some information about the team
-                    team_dict[t] = {"league": l, 
-                                    "emoji": team["Emoji"], 
-                                    "name": f"{team["Location"]} {team["Name"]}", 
-                                    "members": members, 
-                                    "wins": team["Record"]["Regular Season"]["Wins"], 
-                                    "losses": team["Record"]["Regular Season"]["Losses"], 
-                                    "rd": team["Record"]["Regular Season"]["RunDifferential"]}
-        league_dict[l] = league["Teams"]
-    roster_info_dict = {"players": player_dict, "teams": team_dict, "leagues": league_dict}
-    with open("data/roster_info.json", "w") as f:
-        json.dump(roster_info_dict, f)
-        f.close()
+
+    # First fetch the league records and gather all their team IDs.
+    teams_to_fetch = []
+
+    for league_id in tqdm(
+        league_ids,
+        desc="Fetching leagues",
+        unit="league",
+        dynamic_ncols=True,
+    ):
+        try:
+            league = get_json_with_retries(
+                f"https://mmolb.com/api/league/{league_id}"
+            )
+        except RuntimeError as error:
+            tqdm.write(
+                f"Skipping league {league_id}: {error}"
+            )
+            continue
+
+        league_dict[league_id] = league["Teams"]
+
+        for team_id in league["Teams"]:
+            teams_to_fetch.append((league_id, team_id))
+
+    # Remove duplicate league/team pairs while preserving order.
+    teams_to_fetch = list(dict.fromkeys(teams_to_fetch))
+
+    with ThreadPoolExecutor(
+        max_workers=FETCH_WORKERS
+    ) as executor:
+        fetched_teams = executor.map(
+            fetch_team,
+            teams_to_fetch,
+        )
+
+        for league_id, team_id, team, error in tqdm(
+            fetched_teams,
+            total=len(teams_to_fetch),
+            desc="Fetching teams",
+            unit="team",
+            dynamic_ncols=True,
+        ):
+            if error is not None:
+                tqdm.write(
+                    f"Skipping team {team_id}: {error}"
+                )
+                continue
+
+            record = team.get("Record", {}).get(
+                "Regular Season",
+                {},
+            )
+
+            wins = record.get("Wins", 0)
+            losses = record.get("Losses", 0)
+
+            # Ignore inactive teams.
+            if wins + losses <= 0:
+                continue
+
+            tqdm.write(
+                f"Fetched team: "
+                f"{team['Location']} {team['Name']}"
+            )
+
+            members = []
+
+            for player in team["Players"]:
+                player_id = player["PlayerID"]
+
+                if player_id == "#":
+                    continue
+
+                position = player["Position"]
+
+                duplicate_position = any(
+                    player_dict[member_id]["position"] == position
+                    for member_id in members
+                    if (
+                        member_id in player_dict
+                        and position not in ["SP", "RP"]
+                    )
+                )
+
+                if duplicate_position:
+                    position = "DH"
+
+                player_dict[player_id] = {
+                    "name": (
+                        f"{player['FirstName']} "
+                        f"{player['LastName']}"
+                    ),
+                    "position": position,
+                    "team": team_id,
+                    "bench": False,
+                }
+
+                members.append(player_id)
+
+            for bench_group in team["Bench"].values():
+                for player in bench_group:
+                    player_id = player["PlayerID"]
+
+                    if player_id == "#":
+                        continue
+
+                    player_dict[player_id] = {
+                        "name": (
+                            f"{player['FirstName']} "
+                            f"{player['LastName']}"
+                        ),
+                        "position": player["Slot"],
+                        "team": team_id,
+                        "bench": True,
+                    }
+
+                    members.append(player_id)
+
+            team_dict[team_id] = {
+                "league": league_id,
+                "emoji": team["Emoji"],
+                "name": (
+                    f"{team['Location']} {team['Name']}"
+                ),
+                "members": members,
+            }
+
+    roster_info = {
+        "players": player_dict,
+        "teams": team_dict,
+        "leagues": league_dict,
+    }
+
+    with open(
+        "data/roster_info.json",
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(roster_info, file, indent=2)
 
 # gather data you need to go to individual player IDs to obtain
 def update_rosters_deep():
-    roster_info = {}
-    if os.path.isfile("data/roster_info.json"):
-        with open("data/roster_info.json", "r") as f:
-            roster_info = json.load(f)
-            counter = 0
-            to_check = len(roster_info["players"].keys())
-            for i in roster_info["players"].keys():
-                player = requests.get(f"https://mmolb.com/api/player/{i}").json()
-                counter += 1
-                print(f"\r\033[KFetching individual player info \033[38;5;239m[{counter:>{len(str(to_check))}}/{to_check:>{len(str(to_check))}} {roster_info["teams"][roster_info["players"][i]["team"]]["emoji"]} {roster_info["players"][i]["name"]:<35}]\033[0m", end="")
-                # obtain effective level
-                eff_level = 1 + len(player["AugmentHistory"])
-                if "AppliedLevelUps" in player.keys():
-                    eff_level += len(player["AppliedLevelUps"])
-                roster_info["players"][i]["effective_level"] = eff_level
-                # obtain the hand they use to throw
-                roster_info["players"][i]["throws"] = player["Throws"]
-                
-                # obtain the sum of tiers on the player's items
-                drip_score = 0
-                for j in player["Equipment"].keys():
-                    if player["Equipment"][j] != None:
-                        for k in player["Equipment"][j]["Effects"]:
-                            drip_score += k["Tier"]
-                roster_info["players"][i]["drip_score"] = drip_score
+    roster_path = "data/roster_info.json"
 
-        with open("data/roster_info.json", "w") as f:
-            json.dump(roster_info, f)
-        print(f"\r\033[KFetching individual player info [done!]")
+    if not os.path.isfile(roster_path):
+        print("Cannot fetch player details: roster_info.json is missing")
+        return
+
+    with open(roster_path, "r", encoding="utf-8") as f:
+        roster_info = json.load(f)
+
+    player_ids = list(roster_info["players"])
+
+    print(
+        f"Fetching individual player info "
+        f"with {FETCH_WORKERS} workers..."
+    )
+
+    progress = tqdm(
+        total=len(player_ids),
+        desc="Fetching player details",
+        unit="player",
+        dynamic_ncols=True,
+    )
+
+    with ThreadPoolExecutor(
+        max_workers=FETCH_WORKERS
+    ) as executor:
+        fetched_players = executor.map(
+            fetch_player,
+            player_ids,
+        )
+
+        for processed_count, (
+            player_id,
+            player,
+            error,
+        ) in enumerate(fetched_players, start=1):
+            progress.update(1)
+
+            if error is not None:
+                tqdm.write(
+                    f"Skipping player {player_id}: {error}"
+                )
+                continue
+
+            player_info = roster_info["players"][player_id]
+
+            effective_level = 1 + len(
+                player.get("AugmentHistory", [])
+            )
+
+            effective_level += len(
+                player.get("AppliedLevelUps", [])
+            )
+
+            player_info["effective_level"] = effective_level
+            player_info["throws"] = player.get("Throws")
+
+            drip_score = 0
+
+            for equipment in player.get("Equipment", {}).values():
+                if equipment is None:
+                    continue
+
+                for effect in equipment.get("Effects", []):
+                    drip_score += effect.get("Tier", 0)
+
+            player_info["drip_score"] = drip_score
+
+            # Checkpoint occasionally so a later failure does not lose
+            # every successfully fetched player.
+            if processed_count % 100 == 0:
+                with open(
+                    roster_path,
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    json.dump(roster_info, f, indent=2)
+
+    progress.close()
+
+    with open(
+        roster_path,
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(roster_info, f, indent=2)
 
 # update the game list
 def update_games(s, hard_reset=False):
-    # 1. get the games already in the database
-    checked_games = []
-    raw_stuff = {}
-    start_search_from = 0 # the day we start searching from
-    if os.path.isfile("data/all_games.txt"):
-        f = open("data/all_games.txt", "r", encoding="utf-8")
-        for line in f:
-            start_search_from = int(line.strip().split(",")[3]) - 1
-            if int(line.strip().split(",")[3]) not in raw_stuff.keys(): # this helps us skip scraped days in the next step
-                raw_stuff[int(line.strip().split(",")[3])] = [] # O(n) doesn't seem better than O(n^2) until n = 300 lol
-            raw_stuff[int(line.strip().split(",")[3])].append(line.strip())
-            if line.strip().split(",")[5] == "1": # this is the flag for checked games
-                checked_games.append(line.strip().split(",")[0])
-        f.close()
+    games = load_games()
 
-    # 2. get new games (preserve the flag while that happens)
-    game_log = open("data/all_games.txt", "w", encoding="utf-8")
-    season = requests.get(f"https://mmolb.com/api/season/{s}").json()
-    day_counter = 0
-    print(f"Searching for new games...")
-    for d in season["Days"]:
-        day_counter += 1
-        if day_counter < start_search_from: # if the day already passed and the database already has content, there is no new days. saves some api calls
-            if day_counter in raw_stuff.keys():
-                for i in raw_stuff[day_counter]:
-                    game_log.write(f"{i}\n")
-        else:
-            day = requests.get(f"https://mmolb.com/api/day/{d}").json()
-            if day["Season"] != 11 or day["Day"] != 2: # this is to exclusively discard data from the outlier day of s11 d2
-                # print(f"Fetching games played on Season {season["Season"]} Day {day["Day"]}...")
-                stop_early_flag = True
-                for g in day["Games"]:
-                    stop_early_flag = False
-                    if g["GameID"] != "#":
-                        # game ID, away team ID, home team ID, day, complete or not, parsed by my program or not
-                        if g["GameID"] in checked_games and (not hard_reset):
-                            game_log.write(f"{g["GameID"]},{g["AwayTeamID"]},{g["HomeTeamID"]},{day["Day"]},{g["State"]},1\n")
-                        else:
-                            game_log.write(f"{g["GameID"]},{g["AwayTeamID"]},{g["HomeTeamID"]},{day["Day"]},{g["State"]},0\n")
-                if (stop_early_flag or day["Day"] == 240) and True:
-                    # print(f"Fetching concluded at Season {season["Season"]} Day {day["Day"]}")
-                    break
-    game_log.close()
+    start_search_from = 0
+    if games:
+        start_search_from = (
+            max(game["day"] for game in games.values()) - 1
+        )
+
+    season = get_json_with_retries(
+        f"https://mmolb.com/api/season/{s}"
+    )
+
+    for day_counter, day_id in enumerate(
+        tqdm(
+            season["Days"],
+            desc="Searching season days",
+            unit="day",
+            dynamic_ncols=True,
+        ),
+        start=1,
+    ):
+        if day_counter < start_search_from:
+            continue
+
+        try:
+            day = get_json_with_retries(
+                f"https://mmolb.com/api/day/{day_id}"
+            )
+        except RuntimeError as error:
+            tqdm.write(
+                f"Skipping day {day_id} after repeated failures:\n"
+                f"{error}"
+            )
+            continue
+
+        if day["Season"] == 11 and day["Day"] == 2:
+            continue
+
+        stop_early_flag = True
+
+        for game in day["Games"]:
+            stop_early_flag = False
+
+            if game["GameID"] == "#":
+                continue
+
+            game_id = game["GameID"]
+            was_checked = games.get(
+                game_id,
+                {},
+            ).get("checked", False)
+
+            games[game_id] = {
+                "away_team_id": game["AwayTeamID"],
+                "home_team_id": game["HomeTeamID"],
+                "day": day["Day"],
+                "state": game["State"],
+                "checked": was_checked and not hard_reset,
+            }
+
+        if stop_early_flag or day["Day"] == 240:
+            break
+
+    save_games(games)
+
 
 # add data from unrecorded games to the player_data.json file
-def record_games(toi = None, hard_reset = False):
-    f = open("data/all_games.txt", "r", encoding="utf-8")
-    games = []
-    for line in f:
-        games.append(line.strip().split(","))
-    f.close()
-    
+def record_games(toi=None, hard_reset=False):
+    games = load_games()
     players = {}
 
-    if os.path.isfile("data/player_data.json") and (not hard_reset):
-        with open("data/player_data.json", "r") as f:
+    if os.path.isfile("data/player_data.json") and not hard_reset:
+        with open("data/player_data.json", "r", encoding="utf-8") as f:
             players = json.load(f)
+
+    games_to_record = [
+        (game_id, game_info)
+        for game_id, game_info in games.items()
+        if game_info["state"] == "Complete"
+        and not game_info["checked"]
+        and (
+            toi is None
+            or game_info["away_team_id"] in toi
+            or game_info["home_team_id"] in toi
+        )
+    ]
+
+    progress = tqdm(
+    total=len(games_to_record),
+    desc="Processing games",
+    unit="game",
+    dynamic_ncols=True,
+    )
+
+    # Only game downloads are concurrent. All mutations to `players`,
+    # `games`, and the JSON files still happen here on the main thread.
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
+        fetched_games = executor.map(fetch_game, games_to_record)
+
+        for processed_count, (
+            game_id,
+            game_info,
+            game,
+            error,
+        ) in enumerate(fetched_games, start=1):
+            progress.update(1)
+
+            if error is not None:
+                tqdm.write(
+                    f"\nSkipping game {game_id} after repeated request failures:"
+                    f"\n{error}\n"
+                )
+                continue
             
+            away_victory = (
+                game["EventLog"][-1]["away_score"]
+                > game["EventLog"][-1]["home_score"]
+            )
+            
+            tqdm.write(
+                f"Processing game: {game_id} "
+                f"| S{game['Season']} D{game['Day']:<3} "
+                f"| \033[38;5;{157 if away_victory else 217}m"
+                f"{game['AwayTeamName']}\x1b[0m vs. "
+                f"\033[38;5;{217 if away_victory else 157}m"
+                f"{game['HomeTeamName']}\x1b[0m"
+            )
 
-    count_tornado = 0
-    count_all = 0 # this variable is nasty and should be removed posthaste
-    for i in games:
-        # first is obvious, i[5] == 0 makes sure to avoid double-counting data, final one skips games we don't care about rn
-        if i[4] == "Complete" and i[5] == "0" and (toi == None or (i[1] in toi or i[2] in toi)):
-            count_tornado += 1
-            game = requests.get(f"https://mmolb.com/api/game/{i[0]}").json()
+            # Tick up standard game stats.
+            for team in game["Stats"]:
+                for player_id in game["Stats"][team]:
+                    if player_id not in players:
+                        players[player_id] = {}
 
-            # tick up data from the game being examined
-            away_victory = game["EventLog"][-1]["away_score"] > game["EventLog"][-1]["home_score"]
-            print(f"Processing game: {i[0]} | S{game["Season"]} D{game["Day"]:<3} | \033[38;5;{157 if away_victory else 217}m{game["AwayTeamName"]}\x1b[0m vs. \033[38;5;{217 if away_victory else 157}m{game["HomeTeamName"]}\x1b[0m")
-            for t in game["Stats"]: # team
-                for p in game["Stats"][t]: # player
-                    if p not in players:
-                        players[p] = {}
-                    for stat in game["Stats"][t][p]:
-                        if stat not in players[p]:
-                            players[p][stat] = game["Stats"][t][p][stat]
-                        else:
-                            players[p][stat] += game["Stats"][t][p][stat]
-            # TODO: hypothetical defense tracking goes here
-            # import defense, call a function that returns a package that looks exactly like the API stats dictionary
+                    for stat, value in game["Stats"][team][player_id].items():
+                        players[player_id][stat] = (
+                            players[player_id].get(stat, 0) + value
+                        )
+
+            # Tick up parsed fielding stats.
             defense_stats = defense.parse_fielding(game)
-            for p in defense_stats:
-                if p not in players:
-                    players[p] = {}
-                for stat in defense_stats[p]:
-                    if stat not in players[p]:
-                        players[p][stat] = defense_stats[p][stat]
-                    else:
-                        players[p][stat] += defense_stats[p][stat]
-            # then ingest it as usual
-            for e in game["EventLog"]:
-                if e["event"] == "Pitch":
-                    pitch = "".join(e["pitch_info"].strip().split()[1:])
-                    zone = e["zone"]
-                    if "pitch_data" not in players[e["pitcher"]["id"]]:
-                        players[e["pitcher"]["id"]]["pitch_data"] = {}
-                    if pitch not in players[e["pitcher"]["id"]]["pitch_data"]:
-                        players[e["pitcher"]["id"]]["pitch_data"][pitch] = {"1": 0, "2": 0, "3": 0, "4": 0, "5": 0, "6": 0, "7": 0, "8": 0, "9": 0, "11": 0, "12": 0, "13": 0, "14": 0}
-                    players[e["pitcher"]["id"]]["pitch_data"][pitch][str(zone)] += 1
-                
-            games[count_all][5] = "1"
-        count_all += 1
-    
-    # change game list to reflect the now recorded games:
-    f = open("data/all_games.txt", "w", encoding="utf-8")
-    for i in games:
-        f.write(f"{",".join(i)}\n")
-    f.close()
 
-    with open("data/player_data.json", "w") as f:
+            for player_id, player_stats in defense_stats.items():
+                if player_id not in players:
+                    players[player_id] = {}
+
+                for stat, value in player_stats.items():
+                    players[player_id][stat] = (
+                        players[player_id].get(stat, 0) + value
+                    )
+
+            # Tick up pitch-location data.
+            for event in game["EventLog"]:
+                if event["event"] != "Pitch":
+                    continue
+
+                pitcher = event.get("pitcher")
+                pitch_info = event.get("pitch_info")
+                zone = event.get("zone")
+
+                if (
+                    not pitcher
+                    or not pitcher.get("id")
+                    or not pitch_info
+                    or zone is None
+                ):
+                    continue
+
+                pitcher_id = pitcher["id"]
+                pitch = "".join(pitch_info.strip().split()[1:])
+                zone = str(zone)
+
+                if pitcher_id not in players:
+                    players[pitcher_id] = {}
+
+                pitch_data = players[pitcher_id].setdefault(
+                    "pitch_data",
+                    {},
+                )
+
+                if pitch not in pitch_data:
+                    pitch_data[pitch] = {
+                        "1": 0,
+                        "2": 0,
+                        "3": 0,
+                        "4": 0,
+                        "5": 0,
+                        "6": 0,
+                        "7": 0,
+                        "8": 0,
+                        "9": 0,
+                        "11": 0,
+                        "12": 0,
+                        "13": 0,
+                        "14": 0,
+                    }
+
+                if zone not in pitch_data[pitch]:
+                    tqdm.write(
+                        f"Unknown pitch zone {zone} in game {game_id}; "
+                        "skipping pitch"
+                    )
+                    continue
+
+                pitch_data[pitch][zone] += 1
+
+            game_info["checked"] = True
+
+            # Less frequent checkpoints avoid repeatedly rewriting large
+            # JSON files while still limiting lost work after a crash.
+            if processed_count % 100 == 0:
+                save_games(games)
+
+                with open(
+                    "data/player_data.json",
+                    "w",
+                    encoding="utf-8",
+                ) as f:
+                    json.dump(players, f)
+
+    progress.close()
+
+    # Save the final partial batch.
+    save_games(games)
+
+    with open(
+        "data/player_data.json",
+        "w",
+        encoding="utf-8",
+    ) as f:
         json.dump(players, f)
+
 
 # create a json that stores common human metrics for players
 def calculate_human_stats():
@@ -468,15 +853,42 @@ def search_program():
     while prompt.lower() not in ["1", "close", "exit", "cls"]:
         prompt = input("Look up team by ID or name: ")
         flag = False
-        # if user entered a name instead of an ID, set the input to be the ID
-        if prompt not in roster_info["teams"]: 
-            for id in roster_info["teams"]:
-                if roster_info["teams"][id]["name"].lower() == prompt.lower():               
-                    prompt = id
-                    flag = True
-                    break
-        else:
+        teams = roster_info["teams"]
+
+        # Direct team ID lookup
+        if prompt in teams:
             flag = True
+
+        else:
+            normalized_prompt = prompt.strip().lower()
+
+            name_to_id = {
+                team_info["name"].lower(): team_id
+                for team_id, team_info in teams.items()
+            }
+
+            # Exact team-name lookup
+            if normalized_prompt in name_to_id:
+                prompt = name_to_id[normalized_prompt]
+                flag = True
+
+            else:
+                matches = get_close_matches(
+                    normalized_prompt,
+                    name_to_id,
+                    n=1,
+                    cutoff=0.6,
+                )
+
+                if matches:
+                    matched_name = matches[0]
+                    prompt = name_to_id[matched_name]
+                    flag = True
+
+                    print(
+                        f'No exact match. Using '
+                        f'"{teams[prompt]["name"]}".'
+                    )
 
         if flag:
             print(f"{roster_info["teams"][prompt]["emoji"]} {roster_info["teams"][prompt]["name"]}")
@@ -528,7 +940,7 @@ def search_program():
                 if config.edit():
                     print("as the league list has changed the program will now exit; please run again to begin adding new data")
                     print("yes this is kind of stupid. maybe azurite will change it later?")
-                    os.remove("data/all_games.txt")
+                    os.remove(ALL_GAMES_PATH)
                     os.remove("data/player_data.json")
                     os.remove("data/processed_player_data.json")
                     os.remove("data/roster_info.json")
@@ -631,30 +1043,9 @@ def print_overview(playerID, roster_info, numbers, header="position"):
                 to_print += f"{k} {color(k, numbers[playerID][k])}{f"{numbers[playerID][k]:.3f}":>6}\x1b[0m | "
     print(to_print)
 
-def all_stars():
-    pass
-    # batters: min. ???
-    # DH:  home runs
-    # C:   OBP
-    # 1B:  AVG
-    # 2B:  OPS
-    # 3B:  SLG
-    # SS:  RBI
-    # LF:  singles
-    # CF:  stolen bases
-    # RF:  runs
-    # ptichers: min. 30 IP sans closers
-    # SP1: QS
-    # SP2: wins
-    # SP3: H/9
-    # SP4: K/9
-    # SP5: ERA
-    # RP1: WHIP
-    # RP2: K/BB
-    # RP3: worst HR/9
-    # CL:  saves
-    
 with chdir(os.path.dirname(os.path.realpath(__file__))):
+    
+
     current = requests.get("https://mmolb.com/api/seasons").json()["seasons"][0]["season_id"]
     yesno = ""
 
@@ -673,18 +1064,15 @@ with chdir(os.path.dirname(os.path.realpath(__file__))):
         update_rosters()
         update_rosters_deep()
     else:
-        yesno = input("Update roster information? (enter 'y' for regular update, 'q' for quick update, and 'd' for deep update)\n")
+        yesno = input("Update players? (takes a while) (enter 'yes' to activate)\n")
         if yesno.lower() in ["y", "yes"]:
             update_rosters()
-            yesno = input("Update individual player information? (enter 'y' for yes)")
-        if yesno.lower() in ["q", "quick"]:
-            update_rosters(quick=True)
         if yesno.lower() in ["d", "deep", "depth"]:
             update_rosters()
             update_rosters_deep()
             
     # games initialization
-    if configuration["auto_game_update"] == "on" or not os.path.isfile("data/all_games.txt") or input("Update games? (takes a while) (enter 'yes' to activate) (do this on your first run)\n").lower() in ["y", "yes"]:
+    if configuration["auto_game_update"] == "on" or not os.path.isfile(ALL_GAMES_PATH) or input("Update games? (takes a while) (enter 'yes' to activate) (do this on your first run)\n").lower() in ["y", "yes"]:
         update_games(current)
         with open("data/roster_info.json", "r") as f:
             roster_info = json.load(f)
@@ -698,8 +1086,7 @@ with chdir(os.path.dirname(os.path.realpath(__file__))):
     # quality_starts("wins")
     search_program()
 
-# TODO: migrate all_games.txt to a json file
-# TODO: make a quick" roster update option"
+# TODO: make a "quick" roster update option
 
 
 # roster_info

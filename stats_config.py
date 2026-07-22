@@ -17,7 +17,7 @@ def valid_options():
                             "maple":        "6805db0cac48194de3cd3feb", 
                             "cricket":      "6805db0cac48194de3cd3fec", 
                             "tornado":      "6805db0cac48194de3cd3fed",
-                            "coleoptera":   "6805db0cac48194de3cd3fee", 
+                            "coleopetra":   "6805db0cac48194de3cd3fee", 
                             "clean":        "6805db0cac48194de3cd3fef",
                             "shiny":        "6805db0cac48194de3cd3ff0", 
                             "psychic":      "6805db0cac48194de3cd3ff1", 
