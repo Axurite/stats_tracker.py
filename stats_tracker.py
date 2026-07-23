@@ -831,6 +831,7 @@ def search_program():
         prompt = input("Look up team by ID or name: ")
         flag = False
         teams = roster_info["teams"]
+        matches = ""
 
         # Direct team ID lookup
         if prompt in teams:
@@ -857,15 +858,7 @@ def search_program():
                     cutoff=0.6,
                 )
 
-                if matches:
-                    matched_name = matches[0]
-                    prompt = name_to_id[matched_name]
-                    flag = True
-
-                    print(
-                        f'No exact match. Using '
-                        f'"{teams[prompt]["name"]}".'
-                    )
+                
 
         if flag:
             print(f"{roster_info["teams"][prompt]["emoji"]} {roster_info["teams"][prompt]["name"]}")
@@ -873,18 +866,7 @@ def search_program():
                 print_overview(m, roster_info, numbers)
 
         if not flag:
-            if prompt == "hard_reset":
-                pass
-                # current = requests.get("https://mmolb.com/api/seasons").json()["seasons"][0]["season_id"]
-                # update_games(current, hard_reset=True)
-                # get_league_set = []
-                # temp = open("data/all_teams.txt", "r", encoding="utf-8")
-                # for t in temp:
-                #     if t.strip().split(",")[1] == "6805db0cac48194de3cd3fed":
-                #         get_league_set.append(t.strip().split(",")[0])
-                # record_games(toi=get_league_set, hard_reset=True)
-                # calculate_human_stats()
-            elif prompt.lower() == "legend":
+            if prompt.lower() == "legend":
                 legend()
             elif prompt[:11].lower() == "leaderboard":
                 prompt = prompt.split(" ")
@@ -923,6 +905,20 @@ def search_program():
                     os.remove("data/roster_info.json")
                     os.remove("data/stat_barriers.json")
                     return
+            elif matches: # fuzzy search, now prioritized after leaderboards
+                matched_name = matches[0]
+                prompt = name_to_id[matched_name]
+
+                print(
+                    f'No exact match. Using '
+                    f'"{teams[prompt]["name"]}".'
+                )
+                
+                print(f"{roster_info["teams"][prompt]["emoji"]} {roster_info["teams"][prompt]["name"]}")
+                for m in roster_info["teams"][prompt]["members"]:
+                    print_overview(m, roster_info, numbers)
+                
+                
             elif prompt.lower() not in ["1", "close", "exit", "cls"]:
                 print("team not found :(")
         print("")
