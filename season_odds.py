@@ -3,9 +3,7 @@ import json
 import random as r
 from tqdm import tqdm
 
-def sim():
-    with open("data/roster_info.json", "r", encoding="UTF-8") as f:
-        roster_info = json.load(f)
+def sim(roster_info):
         games_played = []
         current_standings = []
         for i in roster_info["teams"].keys():
@@ -53,20 +51,22 @@ def sim():
     
 ranks = {}
 count = 100000
-for i in tqdm(range(count)):
-    result = sim()
-    for j in range(len(result)):
-        if j + 1 not in ranks.keys():
-            ranks[j + 1] = {}
-        if result[j][0] not in ranks[j + 1].keys():
-            ranks[j + 1][result[j][0]] = 0
-        ranks[j + 1][result[j][0]] += 1
-for i in ranks.keys():
-    ranks[i] = {k: v for k, v in sorted(ranks[i].items(), key=lambda item: item[1], reverse=True)}
-print("1ST PLACE")
-for i in ranks[1].keys():
-    print(i, f"{ranks[1][i] * 100 / count:.2f}%")
-print("")
-print("2ND PLACE")
-for i in ranks[2].keys():
-    print(i, f"{ranks[2][i] * 100 / count:.2f}%")
+with open("data/roster_info.json", "r", encoding="UTF-8") as f:
+    roster_info = json.load(f)
+    for i in tqdm(range(count)):
+        result = sim(roster_info)
+        for j in range(len(result)):
+            if j + 1 not in ranks.keys():
+                ranks[j + 1] = {}
+            if result[j][0] not in ranks[j + 1].keys():
+                ranks[j + 1][result[j][0]] = 0
+            ranks[j + 1][result[j][0]] += 1
+    for i in ranks.keys():
+        ranks[i] = {k: v for k, v in sorted(ranks[i].items(), key=lambda item: item[1], reverse=True)}
+    print("1ST PLACE")
+    for i in ranks[1].keys():
+        print(i, f"{ranks[1][i] * 100 / count:.2f}%")
+    print("")
+    print("2ND PLACE")
+    for i in ranks[2].keys():
+        print(i, f"{ranks[2][i] * 100 / count:.2f}%")

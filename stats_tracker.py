@@ -1048,6 +1048,7 @@ with chdir(os.path.dirname(os.path.realpath(__file__))):
             
     # games initialization
     if configuration["auto_game_update"] == "on" or not os.path.isfile(ALL_GAMES_PATH) or input("Update games? (takes a while) (enter 'yes' to activate) (do this on your first run)\n").lower() in ["y", "yes"]:
+        print("Looking for new games...")
         update_games(current)
         with open("data/roster_info.json", "r") as f:
             roster_info = json.load(f)
